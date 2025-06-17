@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::num::NonZeroU16;
 
-use tree_sitter::{InputEdit, Language, Node, Parser, Point, Range, Tree, TreeCursor};
+use tree_sitter::{
+    InputEdit, Language, Node, ParseOptions, Parser, Point, Range, Tree, TreeCursor,
+};
 
 use crate::{INLINE_LANGUAGE, LANGUAGE};
 
@@ -245,6 +247,16 @@ impl Default for MarkdownParser {
 
 impl MarkdownParser {
     /// Parse a slice of UTF8 text.
+    #[deprecated(since = "0.5.0", note = "Prefer `parse_with_options` instead")]
+    pub fn parse_with<T: AsRef<[u8]>, F: FnMut(usize, Point) -> T>(
+        &mut self,
+        callback: &mut F,
+        old_tree: Option<&MarkdownTree>,
+    ) -> Option<MarkdownTree> {
+        self.parse_with_options(callback, old_tree, None, None)
+    }
+
+    /// Parse a slice of UTF8 text.
     ///
     /// # Arguments:
     /// * `text` The UTF8-encoded text to parse.
@@ -252,14 +264,18 @@ impl MarkdownParser {
     ///   If the text of the document has changed since `old_tree` was
     ///   created, then you must edit `old_tree` to match the new text using
     ///   [MarkdownTree::edit].
+    /// * `block_options` The [options][ParseOptions] for the block parsing.
+    /// * `inline_options` The [options][ParseOptions] for the inline parsing.
     ///
     /// Returns a [MarkdownTree] if parsing succeeded, or `None` if:
     ///  * The timeout set with [tree_sitter::Parser::set_timeout_micros] expired
     ///  * The cancellation flag set with [tree_sitter::Parser::set_cancellation_flag] was flipped
-    pub fn parse_with<T: AsRef<[u8]>, F: FnMut(usize, Point) -> T>(
+    pub fn parse_with_options<T: AsRef<[u8]>, F: FnMut(usize, Point) -> T>(
         &mut self,
         callback: &mut F,
         old_tree: Option<&MarkdownTree>,
+        block_options: Option<ParseOptions<'_>>,
+        mut inline_options: Option<ParseOptions<'_>>,
     ) -> Option<MarkdownTree> {
         let MarkdownParser {
             parser,
@@ -272,7 +288,11 @@ impl MarkdownParser {
         parser
             .set_language(block_language)
             .expect("Could not load block grammar");
-        let block_tree = parser.parse_with(callback, old_tree.map(|tree| &tree.block_tree))?;
+        let block_tree = parser.parse_with_options(
+            callback,
+            old_tree.map(|tree| &tree.block_tree),
+            block_options,
+        )?;
         let (mut inline_trees, mut inline_indices) = if let Some(old_tree) = old_tree {
             let len = old_tree.inline_trees.len();
             (Vec::with_capacity(len), HashMap::with_capacity(len))
@@ -322,9 +342,10 @@ impl MarkdownParser {
             }
             ranges.push(range);
             parser.set_included_ranges(&ranges).ok()?;
-            let inline_tree = parser.parse_with(
+            let inline_tree = parser.parse_with_options(
                 callback,
                 old_tree.and_then(|old_tree| old_tree.inline_trees.get(i)),
+                inline_options.as_mut().map(parse_options_borrow_mut),
             )?;
             inline_trees.push(inline_tree);
             inline_indices.insert(node.id(), i);
@@ -353,7 +374,26 @@ impl MarkdownParser {
     ///  * The timeout set with [tree_sitter::Parser::set_timeout_micros] expired
     ///  * The cancellation flag set with [tree_sitter::Parser::set_cancellation_flag] was flipped
     pub fn parse(&mut self, text: &[u8], old_tree: Option<&MarkdownTree>) -> Option<MarkdownTree> {
-        self.parse_with(&mut |byte, _| &text[byte..], old_tree)
+        self.parse_with_options(&mut |byte, _| &text[byte..], old_tree, None, None)
+    }
+}
+
+/// Creates a new [ParseOptions] that mutably borrows all values while not consuming the original.
+fn parse_options_borrow_mut<'a>(options: &'a mut ParseOptions<'_>) -> ParseOptions<'a> {
+    // This is needed because we need to pass in `ParseOptions` multiple times for the inline
+    // language. Since the struct contains `&mut`, it cannot implement `Clone` or `Copy`. We get
+    // around this by manually specifying that we mean to temporarily borrow all fields.
+    // This is obviously somewhat hacky. If `tree-sitter` adds fields to `ParseOptions` that are not
+    // `&mut`, this method might become implossible. Given this situation, the "proper" way to solve
+    // this problem seems to be changing the param type to `&mut ParseOptions` for
+    // `Parser::parse_with_options()` in upstream `tree-sitter` crate.
+    let ParseOptions { progress_callback } = options;
+    ParseOptions {
+        // Cannot do `progress_callback.as_mut().map(..)` due to lifetime complications.
+        progress_callback: match progress_callback {
+            Some(cb) => Some(*cb),
+            None => None,
+        },
     }
 }
 
