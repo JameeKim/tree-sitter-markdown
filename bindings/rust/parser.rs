@@ -275,7 +275,7 @@ impl MarkdownParser {
         callback: &mut F,
         old_tree: Option<&MarkdownTree>,
         block_options: Option<ParseOptions<'_>>,
-        inline_options: Option<ParseOptions<'_>>,
+        mut inline_options: Option<ParseOptions<'_>>,
     ) -> Option<MarkdownTree> {
         let MarkdownParser {
             parser,
@@ -345,7 +345,7 @@ impl MarkdownParser {
             let inline_tree = parser.parse_with_options(
                 callback,
                 old_tree.and_then(|old_tree| old_tree.inline_trees.get(i)),
-                inline_options,
+                inline_options.as_mut().map(parse_options_borrow_mut),
             )?;
             inline_trees.push(inline_tree);
             inline_indices.insert(node.id(), i);
@@ -374,7 +374,26 @@ impl MarkdownParser {
     ///  * The timeout set with [tree_sitter::Parser::set_timeout_micros] expired
     ///  * The cancellation flag set with [tree_sitter::Parser::set_cancellation_flag] was flipped
     pub fn parse(&mut self, text: &[u8], old_tree: Option<&MarkdownTree>) -> Option<MarkdownTree> {
-        self.parse_with_options(&mut |byte, _| &text[byte..], old_tree, None)
+        self.parse_with_options(&mut |byte, _| &text[byte..], old_tree, None, None)
+    }
+}
+
+/// Creates a new [ParseOptions] that mutably borrows all values while not consuming the original.
+fn parse_options_borrow_mut<'a>(options: &'a mut ParseOptions<'_>) -> ParseOptions<'a> {
+    // This is needed because we need to pass in `ParseOptions` multiple times for the inline
+    // language. Since the struct contains `&mut`, it cannot implement `Clone` or `Copy`. We get
+    // around this by manually specifying that we mean to temporarily borrow all fields.
+    // This is obviously somewhat hacky. If `tree-sitter` adds fields to `ParseOptions` that are not
+    // `&mut`, this method might become implossible. Given this situation, the "proper" way to solve
+    // this problem seems to be changing the param type to `&mut ParseOptions` for
+    // `Parser::parse_with_options()` in upstream `tree-sitter` crate.
+    let ParseOptions { progress_callback } = options;
+    ParseOptions {
+        // Cannot do `progress_callback.as_mut().map(..)` due to lifetime complications.
+        progress_callback: match progress_callback {
+            Some(cb) => Some(*cb),
+            None => None,
+        },
     }
 }
 
